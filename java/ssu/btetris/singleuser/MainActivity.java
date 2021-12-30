@@ -14,6 +14,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Message;
 import android.util.Log;
 import android.view.Surface;
 import android.view.View;
@@ -21,6 +22,10 @@ import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.Toast;
 
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.util.Random;
 
 import ssu.btetris.model.Matrix;
@@ -28,22 +33,22 @@ import ssu.btetris.model.JTetris;
 import ssu.btetris.model.JTetris.TetrisState;
 
 public class MainActivity extends AppCompatActivity {
-    private TetrisView myTetView, peerTetView;
-    private BlockView myBlkView, peerBlkView;
+    private TetrisView myTetView, peTetView;
+    private BlockView myBlkView, peBlkView;
     private Button upArrowBtn, leftArrowBtn, rightArrowBtn, downArrowBtn, dropBtn, topLeftBtn, topRightBtn;
     private Button startBtn, pauseBtn, settingBtn, modeBtn, reservedBtn;
     private AlertDialog quitBtn;
-    //private boolean gameStarted = false;
     private int dy = 25, dx = 15; // screen size
 
     private final int reqCode4SettingActivity = 0;
-    private String servHostName = "255.255.255.255";
-    private int servPortNo = 9999;
+    private String servHostName = "172.19.178.48";
+    private int servPortNo = 1111;
+    private boolean mirrorMode = false;
 
-    private JTetrisModel myTetModel;
+    private JTetrisModel myTetModel, peTetModel;
     private Random random;
-    //private TetrisState state;
-    private char currBlk, nextBlk;
+    private char myCurrBlk, myNextBlk;
+    private char peCurrBlk, peNextBlk;
 
     private GameState gameState = GameState.Initial;
     private GameState savedState;
@@ -63,19 +68,22 @@ public class MainActivity extends AppCompatActivity {
         }
     }
     private enum GameCommand {
-        NOP(-1), Quit(0), Start(1), Pause(2), Resume(3), Update(4), Recover(5);
+        NOP(-1), Quit(0), Start(1), Pause(2), Resume(3), Update(4),
+        Recover(5), Abort(6);
         private final int value;
         private GameCommand(int value) { this.value = value; }
         public int value() { return value; }
     }
     int stateTransMatrix[][] = { // stateTransMatrix[currGameState][GameCommand] --> nextGameState
-            { -1, 1, -1, -1, -1, 2 },  // [Initial][Start] --> Running
+            { -1, 1, -1, -1, -1, 2, 0 },  // [Initial][Start] --> Running
             // [Initial][Recover] --> Paused
-            { 0, -1, 2, -1, 1, -1 },    // [Running][Quit] --> Initial,
+            // [Initial][Abort] --> Initial
+            { 0, -1, 2, -1, 1, -1, 0 },    // [Running][Quit] --> Initial,
             // [Running][Pause] --> Paused,
             // [Running][Update] --> Running,
-            { 0, 1, -1, 1, 2, -1 },     // [Paused][Quit] --> Initial
-            // [Paused][Start,Resume] --> Running
+            // [Running][Abort] --> Initial
+            { 0, 1, -1, 1, 2, -1, -1 },     // [Paused][Quit] --> Initial
+            // [Paused][Start,Resume] --> Running,
             // [Paused][Update] --> Paused
     };
     private void executeCommand(GameCommand cmd, char key) {
@@ -90,6 +98,7 @@ public class MainActivity extends AppCompatActivity {
             case 3: resumeGame(); launchTimer(); break;
             case 4: updateModel(key); break;
             case 5: recoverGame(); break;
+            case 6: abortGame(); break;
             default: Log.d("MainActivity", "unknown command!!!"); break;
         }
     }
@@ -101,19 +110,8 @@ public class MainActivity extends AppCompatActivity {
             switch (id) {
                 case R.id.startBtn: key = 'N';
                     if (gameState == GameState.Initial) cmd = GameCommand.Start;
-                    else if (gameState == GameState.Running) {
-                        // cmd = GameCommand.Quit;
-                        savedState = gameState;
-                        executeCommand(GameCommand.Pause, 'P');
-                        quitBtn.show();
-                        return;
-                    }
-                    else if (gameState == GameState.Paused) {
-                        // cmd = GameCommand.Quit;
-                        savedState = gameState;
-                        quitBtn.show();
-                        return;
-                    }
+                    else if (gameState == GameState.Running) cmd = GameCommand.Quit;
+                    else if (gameState == GameState.Paused) cmd = GameCommand.Quit;
                     break;
                 case R.id.pauseBtn: key = 'P';
                     if (gameState == GameState.Running) cmd = GameCommand.Pause;
@@ -121,6 +119,11 @@ public class MainActivity extends AppCompatActivity {
                     break;
                 case R.id.settingBtn: key = 'S';
                     if (gameState == GameState.Initial) startSettingActivity(reqCode4SettingActivity);
+                    return;
+                case R.id.modeBtn:
+                    mirrorMode = !mirrorMode;
+                    if (mirrorMode) modeBtn.setText("2");
+                    else modeBtn.setText("1");
                     return;
                 case R.id.upArrowBtn: key = 'w'; cmd = GameCommand.Update; break;
                 case R.id.leftArrowBtn: key = 'a'; cmd = GameCommand.Update; break;
@@ -158,7 +161,7 @@ public class MainActivity extends AppCompatActivity {
         myBlkView.init(JTetris.iScreenDw);
         //logMatrix(myTetModel.getScreen());
         myTetView.accept(myTetModel.getScreen());
-        myBlkView.accept(myTetModel.getBlock(nextBlk));
+        myBlkView.accept(myTetModel.getBlock(myNextBlk));
         myTetView.invalidate();
         myBlkView.invalidate();
         //[END] recover random, TetrisView, and BlockView.
@@ -168,13 +171,15 @@ public class MainActivity extends AppCompatActivity {
         try {
             TetrisState state; // model state
             state = myTetModel.accept(key);
+            if (mirrorMode) sendToPeer(key);
             myTetView.accept(myTetModel.getScreen());
             if (state == TetrisState.NewBlock){
-                currBlk = nextBlk;
-                nextBlk = (char) ('0' + random.nextInt(JTetris.nBlockTypes));
-                state = myTetModel.accept(currBlk);
+                myCurrBlk = myNextBlk;
+                myNextBlk = (char) ('0' + random.nextInt(JTetris.nBlockTypes));
+                state = myTetModel.accept(myCurrBlk);
+                if (mirrorMode) sendToPeer(myNextBlk); // send myNextBlk, not myCurrBlk!!
                 myTetView.accept(myTetModel.getScreen());
-                myBlkView.accept(myTetModel.getBlock(nextBlk));
+                myBlkView.accept(myTetModel.getBlock(myNextBlk));
                 myBlkView.invalidate();
                 if (state == TetrisState.Finished)
                     executeCommand(GameCommand.Quit, 'Q');
@@ -195,13 +200,16 @@ public class MainActivity extends AppCompatActivity {
             myTetModel = new JTetrisModel(dy, dx);
             myTetView.init(dy, dx, JTetris.iScreenDw);
             myBlkView.init(JTetris.iScreenDw);
-            currBlk = (char) ('0' + random.nextInt(JTetris.nBlockTypes));
-            nextBlk = (char) ('0' + random.nextInt(JTetris.nBlockTypes));
-            state = myTetModel.accept(currBlk);
+            myCurrBlk = (char) ('0' + random.nextInt(JTetris.nBlockTypes));
+            myNextBlk = (char) ('0' + random.nextInt(JTetris.nBlockTypes));
+            state = myTetModel.accept(myCurrBlk);
             myTetView.accept(myTetModel.getScreen());
-            myBlkView.accept(myTetModel.getBlock(nextBlk));
+            myBlkView.accept(myTetModel.getBlock(myNextBlk));
             myTetView.invalidate();
             myBlkView.invalidate();
+            if (mirrorMode) {
+                sendToPeer('N'); sendToPeer(myCurrBlk); sendToPeer(myNextBlk);
+            }
         }
         catch (Exception e) {
             e.printStackTrace();
@@ -211,6 +219,12 @@ public class MainActivity extends AppCompatActivity {
         setButtonsState(); // no argument of flag
         startBtn.setText("N"); // 'N' means New Game.
         Toast.makeText(MainActivity.this, "Game Over!", Toast.LENGTH_SHORT).show();
+        if (mirrorMode) sendToPeer('Q');
+    }
+    private void abortGame() {
+        setButtonsState(); // no argument of flag
+        startBtn.setText("N"); // 'N' means New Game.
+        Toast.makeText(MainActivity.this, "Game Aborted!", Toast.LENGTH_SHORT).show();
     }
     private void pauseGame() {
         setButtonsState();
@@ -222,20 +236,20 @@ public class MainActivity extends AppCompatActivity {
         pauseBtn.setText("P");
         Toast.makeText(MainActivity.this, "Game Resumed!", Toast.LENGTH_SHORT).show();
     }
-    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final Handler handler4Timer = new Handler(Looper.getMainLooper());
     private Runnable runnableTimer = new Runnable() {
         @Override
         public void run() {
             if (gameState == GameState.Running) {
                 updateModel('s');
                 Log.d("MainActivity", "ondraws="+myTetView.ondraw_calls);
-                handler.postDelayed(this, 1000);
+                handler4Timer.postDelayed(this, 1000);
             }
         }
     };
     private void launchTimer() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) // P means 'Android Pie', aka Android 9.0
-            handler.postDelayed(runnableTimer, 0, 1000);
+            handler4Timer.postDelayed(runnableTimer, 0, 1000);
     }
     @Override
     protected void onPause() {
@@ -265,9 +279,14 @@ public class MainActivity extends AppCompatActivity {
         boolean defaultFlag = buttonState[gameState.value()][2];
         startBtn.setEnabled(startFlag);
         pauseBtn.setEnabled(pauseFlag);
-        if (gameState == GameState.Initial) settingBtn.setEnabled(true);
-        else settingBtn.setEnabled(false);
-        modeBtn.setEnabled(false);
+        if (gameState == GameState.Initial) {
+            settingBtn.setEnabled(true);
+            modeBtn.setEnabled(true);
+        }
+        else {
+            settingBtn.setEnabled(false);
+            modeBtn.setEnabled(false);
+        }
         reservedBtn.setEnabled(false);
 
         upArrowBtn.setEnabled(defaultFlag);
@@ -284,8 +303,8 @@ public class MainActivity extends AppCompatActivity {
         Log.d("MainActivity", "onSave(gameState="+gameState+",savedState="+savedState+")");
         outState.putSerializable("myTetModel", myTetModel);
         outState.putInt("savedState", savedState.value());
-        outState.putChar("currBlk", currBlk);
-        outState.putChar("nextBlk", nextBlk);
+        outState.putChar("myCurrBlk", myCurrBlk);
+        outState.putChar("myNextBlk", myNextBlk);
     }
     @Override
     protected void onRestoreInstanceState(Bundle inState) {
@@ -294,8 +313,8 @@ public class MainActivity extends AppCompatActivity {
         Log.d("MainActivity", "onRestore(gameState="+gameState+",savedState="+savedState+")");
         if (savedState != GameState.Initial) {
             myTetModel = (JTetrisModel) inState.getSerializable("myTetModel");
-            currBlk = inState.getChar("currBlk");
-            nextBlk = inState.getChar("nextBlk");
+            myCurrBlk = inState.getChar("myCurrBlk");
+            myNextBlk = inState.getChar("myNextBlk");
             executeCommand(GameCommand.Recover, 'C');
         }
     }
@@ -314,9 +333,9 @@ public class MainActivity extends AppCompatActivity {
             setContentView(R.layout.activity_main_landscape);
         }
         myTetView = (TetrisView) findViewById(R.id.myTetrisView);
-        peerTetView = (TetrisView) findViewById(R.id.peerTetrisView);
+        peTetView = (TetrisView) findViewById(R.id.peerTetrisView);
         myBlkView = (BlockView) findViewById(R.id.myBlockView);
-        peerBlkView = (BlockView) findViewById(R.id.peerBlockView);
+        peBlkView = (BlockView) findViewById(R.id.peerBlockView);
         startBtn = (Button) findViewById(R.id.startBtn);
         pauseBtn = (Button) findViewById(R.id.pauseBtn);
         settingBtn = (Button) findViewById(R.id.settingBtn);
@@ -344,6 +363,8 @@ public class MainActivity extends AppCompatActivity {
         dropBtn.setOnClickListener(OnClickListener);
 
         setButtonsState(); // no argument of flag
+        startThread(runnable4RecvThread); // launch RecvThread before SendThread
+        startThread(runnable4SendThread); // launch SendThread
     }
     private AlertDialog AlertDialogBtnCreate() {
         AlertDialog.Builder builder = new AlertDialog.Builder(MainActivity.this);
@@ -386,4 +407,199 @@ public class MainActivity extends AppCompatActivity {
                         Log.d("MainActivity", "response=(null)");
                 }
             });
+    private void startThread(Runnable runnable) {
+        Thread thread = new Thread(runnable);
+        thread.setDaemon(true);
+        thread.start();
+    }
+    private void sendMessage(Handler h, int type, char key) {
+        while (h == null); // wait for h to be assigned to a handler object
+        Message msg = Message.obtain(h, type);
+        msg.arg1 = key;
+        h.sendMessage(msg);
+    }
+    private Socket socket = null;
+    private final int maxWaitingTime = 3000; // 3 seconds
+    private DataOutputStream outStream = null;
+    private DataInputStream inStream = null;
+    private Object socketReady = new Object();
+    private Object inStreamReady = new Object();
+    private void _disconnectServer() {
+        try {
+            if (outStream != null) outStream.close();
+            if (inStream != null) inStream.close();
+            if (socket != null) socket.close();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        outStream = null;
+        inStream = null;
+        socket = null;
+    }
+    private void disconnectServer() {
+        synchronized(socketReady) {
+            _disconnectServer();
+        }
+    }
+    private boolean connectServer() {
+        synchronized(socketReady) {
+            try {
+                socket = new Socket();
+                socket.connect(new InetSocketAddress(servHostName, servPortNo), maxWaitingTime);
+                outStream = new DataOutputStream(socket.getOutputStream());
+                inStream = new DataInputStream(socket.getInputStream());
+                synchronized (inStreamReady) {
+                    inStreamReady.notify();
+                }
+                return true;
+            } catch (Exception e) {
+                _disconnectServer();
+                e.printStackTrace();
+                return false;
+            }
+        }
+    }
+    private Handler handler4SendThread = null; // handler for Loopback Thread
+    public void sendToPeer(char key) {
+        sendMessage(handler4SendThread, 0, key);
+    }
+    private Runnable runnable4SendThread = new Runnable() { // runnable for SendThread
+        @Override
+        public void run() {
+            Looper.prepare(); // The message loop is ready.
+            handler4SendThread = new Handler(Looper.myLooper()) {
+                public void handleMessage(Message msg) {
+                    try {
+                        char key = (char) msg.arg1;
+                        Log.d("SendThread", "key='"+key+"'["+(int) key+"]");
+                        if (key == 'N') {
+                            if (connectServer() == false) {
+                                sendToMain('A'); // issue 'Abort' command
+                                return;
+                            }
+                        }
+
+                        synchronized(socketReady) {
+                            if (outStream != null) {
+                                Log.d("SendThread", "wrote key='" + key + "'[" + (int) key + "]");
+                                outStream.writeByte(key);
+                                outStream.writeByte('\n');
+                            }
+                        }
+                    }
+                    catch (Exception e) {
+                        e.printStackTrace();
+                    }
+                }
+            };
+            Looper.loop(); // The message loop runs.
+        }
+    };
+    private Runnable runnable4RecvThread = new Runnable() { // runnable for RecvThread
+        @Override
+        public void run() {
+            while (true) {
+                try {
+                    char key;
+                    synchronized (inStreamReady) {
+                        while (inStream == null) inStreamReady.wait();
+                    }
+                    while ((key = (char) inStream.readByte()) != 'Q') {
+                        if (key != '\n') // skip the newline character
+                            sendToMain(key);
+                    }
+                    sendToMain(key); // key == 'Q'
+                }
+                catch (Exception e) {
+                    e.printStackTrace();
+                }
+                disconnectServer();
+            }
+        }
+    };
+    public void sendToMain(char key) {
+        sendMessage(handler4MainThread, 0, key);
+    }
+    private Handler handler4MainThread = new Handler(Looper.getMainLooper()) {
+        public void handleMessage(Message msg) {
+            try {
+                char key = (char) msg.arg1;
+                Log.d("MainThread", "key='"+key+"'["+(int) key+"]");
+                if (key == 'A') { // received 'Abort' command
+                    executeCommand(GameCommand.Abort, 'A');
+                    return;
+                }
+                mirrorPeer(key);
+            } catch (Exception e) { e.printStackTrace(); }
+        }
+    };
+    private boolean waitingForTwoBlks = false;
+    int numOfBlks = -1;
+    private void mirrorPeer(char key) { // similar to the logic of onClick()
+        if (key == 'Q') {
+            Log.d("mirrorPeer", "Quit Game");
+            Toast.makeText(MainActivity.this, "Peer Won!", Toast.LENGTH_SHORT).show();
+        }
+        else if (key == 'N') {
+            waitingForTwoBlks = true;
+            numOfBlks = 0;
+            Log.d("mirrorPeer", "New Game");
+        }
+        else if (waitingForTwoBlks) {
+            if (numOfBlks == 0) {
+                peCurrBlk = key;
+                numOfBlks++;
+                Log.d("mirrorPeer", "1st Block");
+            }
+            else if (numOfBlks == 1) {
+                peNextBlk = key;
+                numOfBlks++;
+                startPeer();
+                waitingForTwoBlks = false;
+                Log.d("mirrorPeer", "2nd Block");
+            }
+        }
+        else {
+            updatePeer(key);
+            Log.d("mirrorPeer", "N-th Block");
+        }
+    }
+    private void startPeer() {
+        try {
+            TetrisState state; // model state
+            peTetModel = new JTetrisModel(dy, dx);
+            peTetView.init(dy, dx, JTetris.iScreenDw);
+            peBlkView.init(JTetris.iScreenDw);
+            // peCurrBlk is initialized in mirrorPeer().
+            // peNextBlk is initialized in mirrorPeer().
+            state = peTetModel.accept(peCurrBlk);
+            peTetView.accept(peTetModel.getScreen());
+            peBlkView.accept(peTetModel.getBlock(peNextBlk));
+            peTetView.invalidate();
+            peBlkView.invalidate();
+            Log.d("MainThread", "startPeer() called!");
+        }
+        catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+    private void updatePeer(char key) {
+        try {
+            TetrisState state; // model state
+            if (peTetModel.isBlockIndex(key)) { // key is a block index.
+                peCurrBlk = peNextBlk;
+                peNextBlk = key;
+                state = peTetModel.accept(peCurrBlk);
+                peBlkView.accept(peTetModel.getBlock(peNextBlk));
+                peBlkView.invalidate();
+            }
+            else { // key is a movement key.
+                state = peTetModel.accept(key);
+                peTetView.accept(peTetModel.getScreen());
+                peTetView.invalidate();
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
 }

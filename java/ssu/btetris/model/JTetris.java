@@ -283,20 +283,6 @@ public class JTetris implements Serializable {
         }else{return 3;}
     }
 
-    void drop_matrix_jewel(Matrix x){
-        for(int i = 17; i >= 3; i--){
-            for(int j = 24; j >= 0; j--){
-                if(A.get_array()[j][i] == 0) continue;
-                int cur = A.get_array()[j][i], cur_height = j+1;
-                while(cur_height <= 24){
-                    if(A.get_array()[cur_height][i] != 0)break;
-                    cur_height++;
-                }
-                A.get_array[j][i] = 0;
-                A.get_array[cur_height -1][i] = cur;
-            }
-        }
-    }
     void setting_wall(Matrix A) {
         for(int i = 17 ; i >= 3 ; i--) {
             for(int j = 24 ; j >= 0 ; j--) {
